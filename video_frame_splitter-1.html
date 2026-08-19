@@ -1,0 +1,525 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Video Frame Splitter — No Smoothing</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family:system-ui, sans-serif; background:#111; color:#eee; min-height:100vh; display:grid; place-items:center; padding:24px; }
+  .app { width:min(900px,100%); background:#191919; border:1px solid #333; border-radius:18px; padding:24px; box-shadow:0 18px 60px #0008; }
+  h1 { margin:0 0 6px; font-size:25px; }
+  .sub { color:#aaa; margin:0 0 22px; }
+  .row { display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
+  input[type=file] { width:100%; padding:14px; border:1px dashed #555; border-radius:12px; background:#111; }
+  button { border:0; border-radius:10px; padding:11px 16px; font-weight:700; cursor:pointer; background:#eee; color:#111; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  .panel { margin-top:18px; padding:16px; background:#101010; border-radius:12px; }
+  .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(145px,1fr)); gap:10px; }
+  .stat { background:#1d1d1d; border-radius:10px; padding:12px; }
+  .label { color:#999; font-size:12px; }
+  .value { font-size:16px; font-weight:700; margin-top:3px; word-break:break-word; }
+  progress { width:100%; height:18px; margin-top:14px; }
+  #log { white-space:pre-wrap; color:#aaa; font:12px ui-monospace,monospace; max-height:180px; overflow:auto; margin-top:12px; }
+  .warn { color:#ffcc66; }
+  .ok { color:#8fda9a; }
+</style>
+</head>
+<body>
+<div class="app">
+  <h1>Video/GIF → Individual Frames</h1>
+  <p class="sub">Native resolution • no image smoothing • local processing</p>
+  <input id="file" type="file" accept="video/mp4,video/webm,video/quicktime,video/x-matroska,image/gif">
+  <div class="row" style="margin-top:14px">
+    <button id="start" disabled>Extract every frame</button>
+    <button id="cancel" disabled>Cancel</button>
+  </div>
+  <div class="panel">
+    <div class="stats">
+      <div class="stat"><div class="label">File</div><div class="value" id="name">—</div></div>
+      <div class="stat"><div class="label">Resolution</div><div class="value" id="res">—</div></div>
+      <div class="stat"><div class="label">Duration</div><div class="value" id="dur">—</div></div>
+      <div class="stat"><div class="label">Detected FPS</div><div class="value" id="fps">—</div></div>
+      <div class="stat"><div class="label">Frames seen</div><div class="value" id="count">0</div></div>
+    </div>
+    <progress id="progress" max="1" value="0"></progress>
+    <div id="status">Choose a video.</div>
+    <div id="log"></div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const fileInput = $('file'), startBtn = $('start'), cancelBtn = $('cancel');
+let selected = null, cancelled = false;
+
+fileInput.addEventListener('change', async () => {
+  selected = fileInput.files[0] || null;
+  startBtn.disabled = !selected;
+  if (!selected) return;
+  $('name').textContent = selected.name;
+  $('status').textContent = 'Reading video metadata…';
+  try {
+    const meta = await readMetadata(selected);
+    $('res').textContent = `${meta.width} × ${meta.height}`;
+    $('dur').textContent = meta.duration ? formatTime(meta.duration) : 'unknown';
+    $('fps').textContent = meta.frameCount
+      ? `${meta.frameCount} frames (GIF)`
+      : (meta.fps ? meta.fps.toFixed(3) : 'browser estimate');
+    $('status').textContent = 'Ready.';
+  } catch (e) {
+    $('status').textContent = 'Could not read this video in your browser.';
+    $('log').textContent = String(e?.stack || e);
+  }
+});
+
+cancelBtn.addEventListener('click', () => cancelled = true);
+
+function isGif(file) {
+  return file.type === 'image/gif' || /\.gif$/i.test(file.name);
+}
+
+async function readMetadata(file) {
+  if (isGif(file)) {
+    const buf = new Uint8Array(await file.arrayBuffer());
+    const gif = new GifReader(buf);
+    const totalDelayMs = gif.frames.reduce((a, f) => a + f.delay, 0);
+    return {
+      width: gif.width,
+      height: gif.height,
+      duration: totalDelayMs / 1000,
+      fps: (gif.frames.length && totalDelayMs) ? gif.frames.length / (totalDelayMs / 1000) : null,
+      frameCount: gif.frames.length
+    };
+  }
+  const url = URL.createObjectURL(file);
+  try {
+    const v = document.createElement('video');
+    v.preload = 'metadata';
+    v.muted = true;
+    v.src = url;
+    await once(v, 'loadedmetadata');
+    return { width:v.videoWidth, height:v.videoHeight, duration:v.duration, fps:null };
+  } finally { URL.revokeObjectURL(url); }
+}
+
+startBtn.addEventListener('click', async () => {
+  if (!selected) return;
+  cancelled = false;
+  startBtn.disabled = true; cancelBtn.disabled = false; fileInput.disabled = true;
+  $('count').textContent = '0'; $('progress').value = 0; $('log').textContent = '';
+  try {
+    if (isGif(selected)) await extractGifFrames(selected);
+    else await extractFrames(selected);
+  } catch (e) {
+    $('status').textContent = 'Extraction failed.';
+    $('log').textContent = String(e?.stack || e);
+  } finally {
+    startBtn.disabled = false; cancelBtn.disabled = true; fileInput.disabled = false;
+  }
+});
+
+const STALL_MS = 15000; // no new frame in this long => treat playback as stalled
+
+// Disable smoothing across every vendor-prefixed variant we might encounter.
+function disableSmoothing(ctx) {
+  ctx.imageSmoothingEnabled = false;
+  ctx.mozImageSmoothingEnabled = false;
+  ctx.webkitImageSmoothingEnabled = false;
+  ctx.msImageSmoothingEnabled = false;
+}
+
+async function extractFrames(file) {
+  $('status').textContent = 'Decoding…';
+  const url = URL.createObjectURL(file);
+  const video = document.createElement('video');
+  video.preload = 'auto'; video.muted = true; video.playsInline = true; video.src = url;
+  await once(video, 'loadedmetadata');
+  await once(video, 'canplay');
+
+  const w = video.videoWidth, h = video.videoHeight;
+  if (!w || !h) throw new Error('No video dimensions found.');
+
+  // IMPORTANT: canvas is exactly the native video dimensions, so drawImage
+  // below is always a 1:1 copy — no scaling ever happens, so smoothing
+  // couldn't introduce interpolation even if left on. We disable it anyway
+  // (see disableSmoothing) as a belt-and-braces guarantee, once here and
+  // again defensively every frame — cheap boolean writes, no real cost.
+  const canvas = document.createElement('canvas');
+  canvas.width = w; canvas.height = h;
+  const ctx = canvas.getContext('2d', { alpha:false });
+  disableSmoothing(ctx);
+
+  // Use requestVideoFrameCallback so captures correspond to presented video
+  // frames instead of an arbitrary timer. The browser's decoder supplies the frames.
+  const zip = new ZipStoreWriter();
+  let frames = 0;
+  let lastMediaTime = -1;
+  let finished = false;
+  let captureInProgress = false;
+  let endedPending = false;
+
+  const done = new Promise((resolve, reject) => {
+    let watchdogTimer = null;
+    const clearWatchdog = () => { if (watchdogTimer) { clearTimeout(watchdogTimer); watchdogTimer = null; } };
+    const resetWatchdog = () => {
+      clearWatchdog();
+      watchdogTimer = setTimeout(() => {
+        fail(new Error(`No new video frame arrived for ${STALL_MS/1000}s — playback looks stalled (backgrounded tab, a codec issue, or a corrupt file). Keep this tab focused and try again, or try a different browser.`));
+      }, STALL_MS);
+    };
+    const finish = () => { clearWatchdog(); finished = true; resolve(); };
+    const fail = (e) => { clearWatchdog(); reject(e); };
+
+    video.addEventListener('error', () => fail(video.error || new Error('Video decode error')), {once:true});
+    video.addEventListener('ended', () => {
+      endedPending = true;
+      if (!captureInProgress) finish();
+    }, {once:true});
+
+    // NOTE: requestVideoFrameCallback is scheduled in exactly ONE place —
+    // the very end of this function. Do not add a second call anywhere
+    // else in here. The previous version scheduled it once mid-function AND
+    // again at the end of every invocation, so every processed frame
+    // doubled the number of concurrent capture chains (1, 2, 4, 8, 16…).
+    // Within a couple dozen frames that's millions of parallel callbacks all
+    // racing to draw into the same canvas — which is exactly what froze the
+    // tab. Only ever schedule the next call once the current one is done.
+    const capture = async (_now, info) => {
+      if (cancelled) { finish(); return; }
+      captureInProgress = true;
+      try {
+        // Skip duplicate callbacks for the same media time.
+        if (info.mediaTime !== lastMediaTime) {
+          lastMediaTime = info.mediaTime;
+          disableSmoothing(ctx);
+          ctx.clearRect(0,0,w,h);
+          ctx.drawImage(video, 0, 0, w, h);
+          const blob = await new Promise(r => canvas.toBlob(r, 'image/png'));
+          if (!blob) throw new Error('PNG encoding failed.');
+          const bytes = new Uint8Array(await blob.arrayBuffer());
+          const filename = `frame_${String(frames + 1).padStart(6,'0')}.png`;
+          await zip.addStoredFile(filename, bytes);
+          frames++;
+          $('count').textContent = String(frames);
+          $('progress').value = (video.duration && isFinite(video.duration))
+            ? Math.min(1, info.mediaTime / video.duration) : 0;
+          $('status').textContent = `Extracting… frame ${frames}`;
+        }
+        resetWatchdog();
+      } catch (e) {
+        captureInProgress = false;
+        fail(e);
+        return;
+      }
+      captureInProgress = false;
+
+      if (cancelled || endedPending || video.ended) finish();
+      else video.requestVideoFrameCallback(capture);
+    };
+
+    if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
+      resetWatchdog();
+      video.requestVideoFrameCallback(capture);
+      video.play().catch(fail);
+    } else {
+      fail(new Error('This browser lacks requestVideoFrameCallback. Use a recent Chrome/Edge/Firefox/Safari.'));
+    }
+  });
+
+  await done;
+  video.pause(); video.removeAttribute('src'); video.load(); URL.revokeObjectURL(url);
+  if (cancelled) { $('status').textContent = `Cancelled after ${frames} frames.`; return; }
+  $('status').textContent = `Packaging ${frames} PNG frames…`;
+  const zipBlob = await zip.finalize();
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(zipBlob);
+  a.download = `${stripExt(file.name)}_frames.zip`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+  $('progress').value = 1;
+  $('status').textContent = `Done — ${frames} frames saved to ${a.download}`;
+  $('log').textContent = 'Anti-aliasing/interpolation: OFF\nNative frame resolution: YES\nPixel resampling: none';
+}
+
+function once(target, event) { return new Promise((resolve, reject) => { target.addEventListener(event, resolve, {once:true}); target.addEventListener('error', reject, {once:true}); }); }
+function stripExt(n) { return n.replace(/\.[^.]+$/, ''); }
+function formatTime(s) { const m=Math.floor(s/60), sec=(s%60).toFixed(2).padStart(5,'0'); return `${m}:${sec}`; }
+
+// ---------------------------------------------------------------------
+// GIF path. <video> can't decode animated GIFs, so this is a fully
+// separate pipeline: a small dependency-free GIF89a parser + LZW
+// decoder, frame-by-frame, composited per each frame's disposal method
+// (so a frame that only updates part of the image still looks right),
+// then the same PNG + STORE-zip packaging as the video path.
+// ---------------------------------------------------------------------
+
+class GifReader {
+  constructor(buf) { this.buf = buf; this.p = 0; this._parseHeader(); }
+  _u8() { return this.buf[this.p++]; }
+  _u16() { const v = this.buf[this.p] | (this.buf[this.p+1] << 8); this.p += 2; return v; }
+  _parseHeader() {
+    const sig = String.fromCharCode.apply(null, this.buf.subarray(0, 6));
+    if (sig !== 'GIF87a' && sig !== 'GIF89a') throw new Error('Not a GIF file (bad signature).');
+    this.p = 6;
+    this.width = this._u16();
+    this.height = this._u16();
+    const packed = this._u8();
+    this.gctFlag = !!(packed & 0x80);
+    this.gctSize = 2 << (packed & 0x07);
+    this.bgIndex = this._u8();
+    this._u8(); // pixel aspect ratio, unused
+    this.gct = this.gctFlag ? this._readColorTable(this.gctSize) : null;
+    this.frames = [];
+    this._parseFrames();
+  }
+  _readColorTable(n) {
+    const table = [];
+    for (let i = 0; i < n; i++) table.push([this._u8(), this._u8(), this._u8()]);
+    return table;
+  }
+  _skipSubBlocks() { while (true) { const size = this._u8(); if (!size) break; this.p += size; } }
+  _readSubBlocks() {
+    const chunks = []; let total = 0;
+    while (true) {
+      const size = this._u8();
+      if (!size) break;
+      chunks.push(this.buf.subarray(this.p, this.p + size));
+      this.p += size; total += size;
+    }
+    const out = new Uint8Array(total);
+    let o = 0;
+    for (const c of chunks) { out.set(c, o); o += c.length; }
+    return out;
+  }
+  _parseFrames() {
+    let gce = null;
+    while (this.p < this.buf.length) {
+      const block = this._u8();
+      if (block === 0x21) { // extension
+        const label = this._u8();
+        if (label === 0xF9) { // graphic control extension
+          this._u8(); // block size, always 4
+          const packed = this._u8();
+          const delay = this._u16();
+          const transparentIndex = this._u8();
+          this._u8(); // terminator
+          gce = {
+            disposal: (packed >> 2) & 0x07,
+            transparent: !!(packed & 0x01),
+            transparentIndex,
+            delay: (delay || 10) * 10 // ms, GIF stores centiseconds; 0 -> treat as 100ms
+          };
+        } else {
+          this._skipSubBlocks();
+        }
+      } else if (block === 0x2C) { // image descriptor
+        const x = this._u16(), y = this._u16(), w = this._u16(), h = this._u16();
+        const packed = this._u8();
+        const lctFlag = !!(packed & 0x80);
+        const interlace = !!(packed & 0x40);
+        const lctSize = 2 << (packed & 0x07);
+        const lct = lctFlag ? this._readColorTable(lctSize) : null;
+        const minCodeSize = this._u8();
+        const data = this._readSubBlocks();
+        this.frames.push({
+          x, y, w, h, interlace,
+          colorTable: lct || this.gct,
+          minCodeSize, data,
+          delay: gce ? gce.delay : 100,
+          disposal: gce ? gce.disposal : 0,
+          transparent: gce ? gce.transparent : false,
+          transparentIndex: gce ? gce.transparentIndex : -1
+        });
+        gce = null;
+      } else if (block === 0x3B) { // trailer
+        break;
+      } else {
+        break; // unexpected byte — stop rather than loop forever on a corrupt file
+      }
+    }
+  }
+}
+
+// GIF-flavored LZW decompression (variable code width, clear/EOI codes).
+function lzwDecode(minCodeSize, data, pixelCount) {
+  const out = new Uint8Array(pixelCount);
+  let outPos = 0;
+  const clearCode = 1 << minCodeSize;
+  const eoiCode = clearCode + 1;
+  let dict, next, codeSize;
+  function resetDict() {
+    dict = new Array(4096);
+    for (let i = 0; i < clearCode; i++) dict[i] = [i];
+    next = eoiCode + 1;
+    codeSize = minCodeSize + 1;
+  }
+  resetDict();
+  let bitBuf = 0, bitCount = 0, pos = 0, prev = null;
+  function readCode() {
+    while (bitCount < codeSize) {
+      if (pos >= data.length) return eoiCode;
+      bitBuf |= data[pos++] << bitCount;
+      bitCount += 8;
+    }
+    const code = bitBuf & ((1 << codeSize) - 1);
+    bitBuf >>= codeSize; bitCount -= codeSize;
+    return code;
+  }
+  while (outPos < pixelCount) {
+    const code = readCode();
+    if (code === clearCode) { resetDict(); prev = null; continue; }
+    if (code === eoiCode) break;
+    let entry;
+    if (code < next && dict[code]) entry = dict[code];
+    else if (code === next && prev) entry = prev.concat([prev[0]]);
+    else break; // corrupt stream — bail rather than throw mid-file
+    for (let i = 0; i < entry.length && outPos < pixelCount; i++) out[outPos++] = entry[i];
+    if (prev) {
+      dict[next++] = prev.concat([entry[0]]);
+      if (next === (1 << codeSize) && codeSize < 12) codeSize++;
+    }
+    prev = entry;
+  }
+  return out;
+}
+
+function writePixel(rgba, p, idx, table, transparent, transparentIndex) {
+  const o = p * 4;
+  if (transparent && idx === transparentIndex) { rgba[o+3] = 0; return; }
+  const c = (table && table[idx]) || [0, 0, 0];
+  rgba[o] = c[0]; rgba[o+1] = c[1]; rgba[o+2] = c[2]; rgba[o+3] = 255;
+}
+
+// GIF interlace row order: passes at step 8, 8, 4, 2 starting rows 0,4,2,1.
+function deinterlaceRowOrder(h) {
+  const rows = [];
+  for (const [start, step] of [[0,8],[4,8],[2,4],[1,2]]) {
+    for (let y = start; y < h; y += step) rows.push(y);
+  }
+  return rows;
+}
+
+async function extractGifFrames(file) {
+  $('status').textContent = 'Decoding GIF…';
+  const buf = new Uint8Array(await file.arrayBuffer());
+  const gif = new GifReader(buf);
+  const w = gif.width, h = gif.height;
+  if (!w || !h) throw new Error('No GIF dimensions found.');
+
+  const totalFrames = gif.frames.length;
+  if (!totalFrames) throw new Error('No frames found in this GIF.');
+
+  // Output canvas: exactly native GIF dimensions, no scaling, smoothing off.
+  const canvas = document.createElement('canvas');
+  canvas.width = w; canvas.height = h;
+  const ctx = canvas.getContext('2d', { alpha:true });
+  disableSmoothing(ctx);
+
+  // Backing canvas accumulates frames the way a GIF player would —
+  // later frames often only redraw a sub-rectangle over earlier ones.
+  const back = document.createElement('canvas');
+  back.width = w; back.height = h;
+  const bctx = back.getContext('2d', { alpha:true });
+  disableSmoothing(bctx);
+
+  const zip = new ZipStoreWriter();
+  let frames = 0;
+  let pendingDisposal = null; // disposal info for the frame just drawn, applied before the NEXT frame
+  let restoreBackup = null;   // saved pixels for disposal method 3 (restore to previous)
+
+  for (let i = 0; i < totalFrames; i++) {
+    if (cancelled) break;
+    const f = gif.frames[i];
+
+    // Apply the PREVIOUS frame's disposal before drawing this one.
+    if (pendingDisposal) {
+      if (pendingDisposal.disposal === 2) {
+        bctx.clearRect(pendingDisposal.x, pendingDisposal.y, pendingDisposal.w, pendingDisposal.h);
+      } else if (pendingDisposal.disposal === 3 && restoreBackup) {
+        bctx.putImageData(restoreBackup, pendingDisposal.x, pendingDisposal.y);
+      }
+      pendingDisposal = null;
+    }
+
+    // If THIS frame wants "restore to previous", snapshot the region first.
+    restoreBackup = (f.disposal === 3) ? bctx.getImageData(f.x, f.y, f.w, f.h) : null;
+
+    const pixelCount = f.w * f.h;
+    const indices = lzwDecode(f.minCodeSize, f.data, pixelCount);
+    const rgba = new Uint8ClampedArray(pixelCount * 4);
+
+    if (f.interlace) {
+      const rowOrder = deinterlaceRowOrder(f.h);
+      for (let srcRow = 0; srcRow < f.h; srcRow++) {
+        const destRow = rowOrder[srcRow];
+        for (let x = 0; x < f.w; x++) {
+          writePixel(rgba, destRow * f.w + x, indices[srcRow * f.w + x], f.colorTable, f.transparent, f.transparentIndex);
+        }
+      }
+    } else {
+      for (let p = 0; p < pixelCount; p++) {
+        writePixel(rgba, p, indices[p], f.colorTable, f.transparent, f.transparentIndex);
+      }
+    }
+    bctx.putImageData(new ImageData(rgba, f.w, f.h), f.x, f.y);
+    pendingDisposal = { x:f.x, y:f.y, w:f.w, h:f.h, disposal:f.disposal };
+
+    // Composite the full accumulated canvas — this is what the frame
+    // actually looks like when played, not just its own sub-rectangle.
+    ctx.clearRect(0, 0, w, h);
+    disableSmoothing(ctx);
+    ctx.drawImage(back, 0, 0);
+
+    const blob = await new Promise(r => canvas.toBlob(r, 'image/png'));
+    if (!blob) throw new Error('PNG encoding failed.');
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    const filename = `frame_${String(frames + 1).padStart(6,'0')}.png`;
+    await zip.addStoredFile(filename, bytes);
+    frames++;
+    $('count').textContent = String(frames);
+    $('progress').value = totalFrames ? frames / totalFrames : 0;
+    $('status').textContent = `Extracting… frame ${frames} / ${totalFrames}`;
+    await new Promise(r => setTimeout(r, 0)); // yield so the UI stays responsive
+  }
+
+  if (cancelled) { $('status').textContent = `Cancelled after ${frames} frames.`; return; }
+  $('status').textContent = `Packaging ${frames} PNG frames…`;
+  const zipBlob = await zip.finalize();
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(zipBlob);
+  a.download = `${stripExt(file.name)}_frames.zip`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+  $('progress').value = 1;
+  $('status').textContent = `Done — ${frames} frames saved to ${a.download}`;
+  $('log').textContent = 'Source: GIF\nDisposal-method compositing: YES\nInterlace handling: YES\nPixel resampling: none';
+}
+
+// Minimal ZIP writer using STORE (no recompression). PNGs are already compressed.
+class ZipStoreWriter {
+  constructor(){ this.files=[]; this.offset=0; }
+  async addStoredFile(name, data){
+    const nameBytes=new TextEncoder().encode(name); const crc=crc32(data);
+    const local=new Uint8Array(30+nameBytes.length); const dv=new DataView(local.buffer);
+    u32(dv,0,0x04034b50); u16(dv,4,20); u16(dv,6,0); u16(dv,8,0); u16(dv,10,0); u16(dv,12,0); u32(dv,14,crc); u32(dv,18,data.length); u32(dv,22,data.length); u16(dv,26,nameBytes.length); u16(dv,28,0); local.set(nameBytes,30);
+    this.files.push({nameBytes,data,crc,local,offset:this.offset}); this.offset += local.length + data.length;
+  }
+  async finalize(){
+    let centralLength=0; for(const f of this.files) centralLength += 46+f.nameBytes.length;
+    const centralOffset=this.offset, total=this.offset+centralLength+22;
+    const out=new Uint8Array(total); let p=0;
+    for(const f of this.files){ out.set(f.local,p); p+=f.local.length; out.set(f.data,p); p+=f.data.length; }
+    for(const f of this.files){
+      const dv=new DataView(out.buffer,p,46+f.nameBytes.length); u32(dv,0,0x02014b50); u16(dv,4,20); u16(dv,6,20); u16(dv,8,0); u16(dv,10,0); u16(dv,12,0); u16(dv,14,0); u32(dv,16,f.crc); u32(dv,20,f.data.length); u32(dv,24,f.data.length); u16(dv,28,f.nameBytes.length); u16(dv,30,0); u16(dv,32,0); u16(dv,34,0); u16(dv,36,0); u32(dv,38,0); u32(dv,42,f.offset); out.set(f.nameBytes,p+46); p+=46+f.nameBytes.length;
+    }
+    const end=new DataView(out.buffer,p,22); u32(end,0,0x06054b50); u16(end,4,0); u16(end,6,0); u16(end,8,this.files.length); u16(end,10,this.files.length); u32(end,12,centralLength); u32(end,16,centralOffset); u16(end,20,0);
+    return new Blob([out],{type:'application/zip'});
+  }
+}
+function u16(dv,o,v){dv.setUint16(o,v,true)} function u32(dv,o,v){dv.setUint32(o,v>>>0,true)}
+function crc32(buf){ let c=0xffffffff; for(let i=0;i<buf.length;i++){ c^=buf[i]; for(let k=0;k<8;k++) c=(c>>>1)^((c&1)?0xedb88320:0); } return (c^0xffffffff)>>>0; }
+</script>
+</body>
+</html>
